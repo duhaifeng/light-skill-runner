@@ -2,15 +2,16 @@
 # 优先级：默认值 < 本文件 < 环境变量
 
 llm:
-  provider: openai            # openai | ollama | llamacpp
-  base_url: https://api.openai.com/v1
-  model: gpt-4o-mini
+  provider: socrates-gw       # openai | ollama | llamacpp | socrates-gw
+  base_url: https://socrates-llm-gw.jd.com/v1
+  model: Qwen3.5-397B-A17B-FP8
   api_key: ""                 # 也可用环境变量 LLM_API_KEY
-  force_tool_emulation: false # 本地模型不支持 function-calling 时设为 true
+  force_tool_emulation: true  # 网关未确认原生 function-calling，默认走工具调用模拟
 
 trace:
-  exporters: [file, stream]   # file=JSONL 落盘, stream=SSE 实时推送
+  exporters: [file, log, stream] # file=JSON 落盘, log=文本日志, stream=SSE 实时推送
   dir: ./traces
+  log_dir: ./logs
 
 server:
   port: 8080
@@ -18,5 +19,6 @@ server:
 prompts_dir: ./prompts        # 留空则使用内嵌默认提示词
 skills_dir: ./skills
 workdir: .
+database_path: ./data/light-skill-runner.db
 max_turns: 12
 script_timeout: 60s

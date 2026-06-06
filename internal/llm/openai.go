@@ -14,11 +14,12 @@ import (
 // OpenAIClient 是一个 OpenAI 兼容的 provider 实现。
 // 通过设置不同的 BaseURL，可对接 OpenAI / DeepSeek / Ollama / llama.cpp / vLLM 等。
 type OpenAIClient struct {
-	BaseURL string
-	APIKey  string
-	Model   string
-	HTTP    *http.Client
-	caps    Capabilities
+	BaseURL            string
+	APIKey             string
+	Model              string
+	ChatTemplateKwargs map[string]any
+	HTTP               *http.Client
+	caps               Capabilities
 }
 
 // NewOpenAI 创建一个 OpenAI 兼容客户端。
@@ -59,6 +60,7 @@ func init() {
 	Register("openai", newOpenAICompatible("https://api.openai.com/v1", true))
 	Register("ollama", newOpenAICompatible("http://localhost:11434/v1", true))
 	Register("llamacpp", newOpenAICompatible("http://localhost:8080/v1", false))
+	Register("socrates-gw", newSocratesGW)
 }
 
 // ---- 线缆数据结构（OpenAI Chat Completions 格式）----
@@ -89,9 +91,25 @@ type wireTool struct {
 }
 
 type wireRequest struct {
-	Model    string        `json:"model"`
-	Messages []wireMessage `json:"messages"`
-	Tools    []wireTool    `json:"tools,omitempty"`
+	Model              string         `json:"model"`
+	Messages           []wireMessage  `json:"messages"`
+	Tools              []wireTool     `json:"tools,omitempty"`
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
+}
+
+func newSocratesGW(cfg ProviderConfig) (Client, error) {
+	base := cfg.BaseURL
+	if base == "" {
+		base = "https://socrates-llm-gw.jd.com/v1"
+	}
+	model := cfg.Model
+	if model == "" {
+		model = "Qwen3.5-397B-A17B-FP8"
+	}
+	c := NewOpenAI(base, cfg.APIKey, model)
+	c.caps.SupportsTools = false
+	c.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+	return c, nil
 }
 
 type wireResponse struct {
@@ -111,7 +129,10 @@ type wireResponse struct {
 
 // Chat 实现 Client 接口。
 func (c *OpenAIClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	wreq := wireRequest{Model: c.Model}
+	wreq := wireRequest{
+		Model:              c.Model,
+		ChatTemplateKwargs: c.ChatTemplateKwargs,
+	}
 	for _, m := range req.Messages {
 		wm := wireMessage{
 			Role:       string(m.Role),
@@ -147,7 +168,8 @@ func (c *OpenAIClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse,
 	if err != nil {
 		return ChatResponse{}, err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
+	httpReq.Header.Set("Accept", "application/json")
 	if c.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}

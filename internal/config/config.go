@@ -18,6 +18,7 @@ type Config struct {
 	PromptsDir    string        `yaml:"prompts_dir"`
 	SkillsDir     string        `yaml:"skills_dir"`
 	WorkDir       string        `yaml:"workdir"`
+	DatabasePath  string        `yaml:"database_path"`
 	MaxTurns      int           `yaml:"max_turns"`
 	ScriptTimeout time.Duration `yaml:"script_timeout"`
 }
@@ -37,6 +38,7 @@ type LLMConfig struct {
 type TraceConfig struct {
 	Exporters []string `yaml:"exporters"` // file | stream | langfuse
 	Dir       string   `yaml:"dir"`
+	LogDir    string   `yaml:"log_dir"`
 }
 
 // ServerConfig 描述 Web 服务配置。
@@ -52,13 +54,15 @@ func Default() Config {
 			BaseURL:  "https://api.openai.com/v1",
 		},
 		Trace: TraceConfig{
-			Exporters: []string{"file", "stream"},
+			Exporters: []string{"file", "log", "stream"},
 			Dir:       "./traces",
+			LogDir:    "./logs",
 		},
 		Server:        ServerConfig{Port: 8080},
 		PromptsDir:    "./prompts",
 		SkillsDir:     "./skills",
 		WorkDir:       ".",
+		DatabasePath:  "./data/light-skill-runner.db",
 		MaxTurns:      12,
 		ScriptTimeout: 60 * time.Second,
 	}
@@ -105,6 +109,9 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("WORKDIR"); v != "" {
 		cfg.WorkDir = v
+	}
+	if v := os.Getenv("DATABASE_PATH"); v != "" {
+		cfg.DatabasePath = v
 	}
 	if v := os.Getenv("SERVER_PORT"); v != "" {
 		if p, err := strconv.Atoi(v); err == nil {

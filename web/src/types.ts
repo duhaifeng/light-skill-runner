@@ -3,6 +3,24 @@ export interface Skill {
   description: string;
 }
 
+export interface SkillSetting extends Skill {
+  path: string;
+  enabled: boolean;
+  tags: string;
+  sort_order: number;
+}
+
+export interface ModelConfig {
+  id?: number;
+  name: string;
+  provider: string;
+  base_url: string;
+  model: string;
+  api_key?: string;
+  force_tool_emulation: boolean;
+  is_default: boolean;
+}
+
 export interface TokenUsage {
   prompt: number;
   completion: number;

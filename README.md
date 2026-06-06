@@ -46,11 +46,12 @@ skills/      本地 skill 目录
 
 ## 构建
 
-需要 Go 1.22+。前端产物已内嵌（如需改前端见下文）：
+需要 Go 1.25+。前端产物已内嵌（如需改前端见下文）：
 
 ```bash
 go build -o skill-runner ./cmd/skill-runner
 go build -o skill-server ./cmd/skill-server
+go build -tags "desktop,production" -o skill-desktop ./cmd/skill-desktop
 ```
 
 ## 配置
@@ -59,24 +60,41 @@ go build -o skill-server ./cmd/skill-server
 
 ```yaml
 llm:
-  provider: openai            # openai | ollama | llamacpp
+  provider: openai            # openai | ollama | llamacpp | socrates-gw
   base_url: https://api.openai.com/v1
   model: gpt-4o-mini
   api_key: ""
   force_tool_emulation: false # 本地模型无 function-calling 时设 true
 trace:
-  exporters: [file, stream]
+  exporters: [file, log, stream]
   dir: ./traces
+  log_dir: ./logs
 server:
   port: 8080
 prompts_dir: ./prompts
 skills_dir: ./skills
 workdir: .
+database_path: ./data/light-skill-runner.db
 max_turns: 12
 script_timeout: 60s
 ```
 
-常用环境变量：`LLM_PROVIDER`、`LLM_BASE_URL`、`LLM_MODEL`、`LLM_API_KEY`、`SERVER_PORT`、`SKILLS_DIR`、`PROMPTS_DIR`、`WORKDIR`。
+常用环境变量：`LLM_PROVIDER`、`LLM_BASE_URL`、`LLM_MODEL`、`LLM_API_KEY`、`SERVER_PORT`、`SKILLS_DIR`、`PROMPTS_DIR`、`WORKDIR`、`DATABASE_PATH`。
+
+本地数据库默认写入 `./data/light-skill-runner.db`。建表脚本维护在 `scripts/db`，程序启动时会自动执行迁移；模型配置和 skill 启用状态可以在界面「设置」页维护。
+
+每次运行会写入两类排查文件：完整结构化 trace 在 `./traces/<trace_id>.json`，可读过程日志在 `./logs/<trace_id>.log`，并追加汇总到 `./logs/runs.log`。
+
+### 接苏格拉底网关示例
+
+```yaml
+llm:
+  provider: socrates-gw
+  base_url: https://socrates-llm-gw.jd.com/v1
+  model: Qwen3.5-397B-A17B-FP8
+  api_key: ""
+  force_tool_emulation: true
+```
 
 ### 接本地模型示例
 
@@ -105,6 +123,14 @@ echo "跟我打个招呼" | ./skill-runner         # 管道输入
 ```
 
 浏览器打开后：左侧输入任务并执行，右侧「运行透视」实时展示调用树（LLM 生成、工具调用、token、耗时、输入/输出），「历史」可回看既往运行。
+
+### 桌面端
+
+```bash
+go run -tags dev ./cmd/skill-desktop
+```
+
+桌面端基于 Wails，复用同一套 React 界面与 Go 引擎。启动后可直接输入任务并执行，运行透视与历史记录行为和 Web 版一致。Wails 不能用普通 `go run` 启动，开发运行需要带 `dev` 构建标签，正式构建需要带 `desktop,production` 构建标签。
 
 ## 内置工具
 

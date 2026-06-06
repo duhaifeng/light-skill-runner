@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/duhaifeng/light-skill-runner/internal/config"
 	"github.com/duhaifeng/light-skill-runner/internal/executor"
@@ -13,16 +14,19 @@ import (
 	"github.com/duhaifeng/light-skill-runner/internal/prompt"
 	"github.com/duhaifeng/light-skill-runner/internal/registry"
 	"github.com/duhaifeng/light-skill-runner/internal/runner"
+	"github.com/duhaifeng/light-skill-runner/internal/store"
 	"github.com/duhaifeng/light-skill-runner/internal/tools"
 	"github.com/duhaifeng/light-skill-runner/internal/trace"
 )
 
 // Engine 持有跨次运行复用的资源（配置、skill 注册表、提示词、LLM 客户端）。
 type Engine struct {
+	mu      sync.Mutex
 	cfg     config.Config
 	reg     *registry.Registry
 	prompts *prompt.Manager
 	client  llm.Client
+	store   *store.Store
 }
 
 // RunResult 是一次运行的结果。
@@ -33,7 +37,27 @@ type RunResult struct {
 
 // New 根据配置构建引擎：加载 skill、初始化提示词与 LLM 客户端。
 func New(cfg config.Config) (*Engine, error) {
-	skills, err := loader.Load(cfg.SkillsDir)
+	st, err := store.Open(cfg.DatabasePath)
+	if err != nil {
+		return nil, err
+	}
+	if err := st.SeedModel(store.ModelConfig{
+		Name:               cfg.LLM.Provider + " / " + cfg.LLM.Model,
+		Provider:           cfg.LLM.Provider,
+		BaseURL:            cfg.LLM.BaseURL,
+		Model:              cfg.LLM.Model,
+		APIKey:             cfg.LLM.APIKey,
+		ForceToolEmulation: cfg.LLM.ForceToolEmulation,
+	}); err != nil {
+		return nil, fmt.Errorf("初始化模型配置失败: %w", err)
+	}
+	if m, ok, err := st.DefaultModel(); err != nil {
+		return nil, fmt.Errorf("读取默认模型配置失败: %w", err)
+	} else if ok {
+		applyModel(&cfg, m)
+	}
+
+	skills, err := loadEnabledSkills(cfg.SkillsDir, st)
 	if err != nil {
 		return nil, fmt.Errorf("加载 skill 失败: %w", err)
 	}
@@ -51,22 +75,98 @@ func New(cfg config.Config) (*Engine, error) {
 		reg:     registry.New(skills),
 		prompts: prompt.New(cfg.PromptsDir),
 		client:  client,
+		store:   st,
 	}, nil
 }
 
 // Config 返回引擎配置。
-func (e *Engine) Config() config.Config { return e.cfg }
+func (e *Engine) Config() config.Config {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cfg
+}
 
 // Skills 返回已加载的 skill 列表。
-func (e *Engine) Skills() []loader.Skill { return e.reg.List() }
+func (e *Engine) Skills() []loader.Skill {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.reg.List()
+}
+
+// SkillSettings 返回 UI 可维护的 skill 元信息。
+func (e *Engine) SkillSettings() ([]store.SkillSetting, error) {
+	return e.store.ListSkillSettings()
+}
+
+// UpdateSkillSetting 更新 skill 设置并重新加载内存注册表。
+func (e *Engine) UpdateSkillSetting(name string, enabled bool, tags string, sortOrder int) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.store.UpdateSkillSetting(name, enabled, tags, sortOrder); err != nil {
+		return err
+	}
+	skills, err := loadEnabledSkills(e.cfg.SkillsDir, e.store)
+	if err != nil {
+		return err
+	}
+	e.reg = registry.New(skills)
+	return nil
+}
+
+// Models 返回本地维护的模型配置。
+func (e *Engine) Models() ([]store.ModelConfig, error) {
+	return e.store.ListModels()
+}
+
+// CreateModel 新增模型配置。
+func (e *Engine) CreateModel(m store.ModelConfig) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.store.CreateModel(m); err != nil {
+		return err
+	}
+	if m.IsDefault {
+		return e.reloadDefaultModelLocked()
+	}
+	return nil
+}
+
+// UpdateModel 更新模型配置。
+func (e *Engine) UpdateModel(id int64, m store.ModelConfig) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.store.UpdateModel(id, m); err != nil {
+		return err
+	}
+	if m.IsDefault {
+		return e.reloadDefaultModelLocked()
+	}
+	return nil
+}
+
+// SetDefaultModel 切换默认模型配置，并重建 LLM client。
+func (e *Engine) SetDefaultModel(id int64) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.store.SetDefaultModel(id); err != nil {
+		return err
+	}
+	return e.reloadDefaultModelLocked()
+}
 
 // Run 执行一次任务。extraExporters 可附加导出器（如 SSE 流）。
 func (e *Engine) Run(ctx context.Context, userPrompt string, extraExporters ...trace.Exporter) (RunResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	// 组装导出器：配置中的 file + 调用方附加的。
 	var exporters []trace.Exporter
 	for _, name := range e.cfg.Trace.Exporters {
 		if name == "file" {
 			exporters = append(exporters, trace.NewFileExporter(e.cfg.Trace.Dir))
+		}
+		if name == "log" {
+			exporters = append(exporters, trace.NewLogExporter(e.cfg.Trace.LogDir))
 		}
 	}
 	exporters = append(exporters, extraExporters...)
@@ -89,6 +189,65 @@ func (e *Engine) Run(ctx context.Context, userPrompt string, extraExporters ...t
 	tracer.Finish(output, runErr)
 
 	return RunResult{TraceID: tracer.TraceID(), Output: output}, runErr
+}
+
+func (e *Engine) reloadDefaultModelLocked() error {
+	m, ok, err := e.store.DefaultModel()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("没有默认模型配置")
+	}
+	applyModel(&e.cfg, m)
+	client, err := llm.New(e.cfg.LLM.Provider, llm.ProviderConfig{
+		BaseURL:            e.cfg.LLM.BaseURL,
+		Model:              e.cfg.LLM.Model,
+		APIKey:             e.cfg.LLM.APIKey,
+		ForceToolEmulation: e.cfg.LLM.ForceToolEmulation,
+	})
+	if err != nil {
+		return err
+	}
+	e.client = client
+	return nil
+}
+
+func loadEnabledSkills(skillsDir string, st *store.Store) ([]loader.Skill, error) {
+	skills, err := loader.Load(skillsDir)
+	if err != nil {
+		return nil, err
+	}
+	sources := make([]store.SkillSource, 0, len(skills))
+	for _, sk := range skills {
+		sources = append(sources, store.SkillSource{
+			Name:        sk.Name,
+			Description: sk.Description,
+			Path:        sk.Path,
+		})
+	}
+	if err := st.SyncSkills(sources); err != nil {
+		return nil, err
+	}
+	enabled, err := st.EnabledSkillNames()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]loader.Skill, 0, len(skills))
+	for _, sk := range skills {
+		if enabled[sk.Name] {
+			out = append(out, sk)
+		}
+	}
+	return out, nil
+}
+
+func applyModel(cfg *config.Config, m store.ModelConfig) {
+	cfg.LLM.Provider = m.Provider
+	cfg.LLM.BaseURL = m.BaseURL
+	cfg.LLM.Model = m.Model
+	cfg.LLM.APIKey = m.APIKey
+	cfg.LLM.ForceToolEmulation = m.ForceToolEmulation
 }
 
 // buildSystemPrompt 组装系统提示，并根据 provider 能力决定是否启用工具调用模拟。

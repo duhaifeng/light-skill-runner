@@ -11,6 +11,9 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 // Executor 负责执行脚本，限定工作目录并施加超时。
@@ -47,12 +50,16 @@ func (e *Executor) RunScript(ctx context.Context, path string, args []string) (s
 
 	cmd := exec.CommandContext(ctx, name, cmdArgs...)
 	cmd.Dir = e.WorkDir
+	cmd.Env = append(os.Environ(),
+		"PYTHONIOENCODING=utf-8",
+		"PYTHONUTF8=1",
+	)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 
 	err = cmd.Run()
-	out := buf.String()
+	out := decodeOutput(buf.Bytes())
 	if ctx.Err() == context.DeadlineExceeded {
 		return out, fmt.Errorf("脚本执行超时 (%s)", e.Timeout)
 	}
@@ -86,11 +93,22 @@ func interpreter(path string) (string, []string) {
 	case ".sh":
 		return "bash", []string{path}
 	case ".ps1":
-		return "powershell", []string{"-File", path}
+		return "powershell", []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path}
 	default:
 		if runtime.GOOS == "windows" {
 			return path, nil
 		}
 		return path, nil
 	}
+}
+
+func decodeOutput(data []byte) string {
+	if utf8.Valid(data) {
+		return string(data)
+	}
+	out, err := simplifiedchinese.GB18030.NewDecoder().Bytes(data)
+	if err == nil {
+		return string(out)
+	}
+	return string(data)
 }
