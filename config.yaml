@@ -1,0 +1,22 @@
+# light-skill-runner 配置示例
+# 优先级：默认值 < 本文件 < 环境变量
+
+llm:
+  provider: openai            # openai | ollama | llamacpp
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+  api_key: ""                 # 也可用环境变量 LLM_API_KEY
+  force_tool_emulation: false # 本地模型不支持 function-calling 时设为 true
+
+trace:
+  exporters: [file, stream]   # file=JSONL 落盘, stream=SSE 实时推送
+  dir: ./traces
+
+server:
+  port: 8080
+
+prompts_dir: ./prompts        # 留空则使用内嵌默认提示词
+skills_dir: ./skills
+workdir: .
+max_turns: 12
+script_timeout: 60s
