@@ -51,16 +51,20 @@ func (e *FileExporter) Export(ev Event) {
 
 // LogExporter 把每次运行过程写成可读日志，便于排查桌面端与 skill 执行问题。
 type LogExporter struct {
-	Dir string
+	Dir     string
+	Session string
 }
 
 // NewLogExporter 创建日志导出器。
-func NewLogExporter(dir string) *LogExporter {
+func NewLogExporter(dir, session string) *LogExporter {
 	if dir == "" {
 		dir = "./logs"
 	}
+	if session == "" {
+		session = time.Now().Format("20060102-150405")
+	}
 	_ = os.MkdirAll(dir, 0o755)
-	return &LogExporter{Dir: dir}
+	return &LogExporter{Dir: dir, Session: session}
 }
 
 // Export 实现 Exporter。
@@ -73,7 +77,7 @@ func (e *LogExporter) Export(ev Event) {
 	if line == "" {
 		return
 	}
-	_ = appendLog(filepath.Join(e.Dir, traceID+".log"), line)
+	_ = appendLog(filepath.Join(e.Dir, e.Session+".log"), line)
 	_ = appendLog(filepath.Join(e.Dir, "runs.log"), line)
 }
 

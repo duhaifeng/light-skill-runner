@@ -39,6 +39,9 @@ type ToolSpec struct {
 type ChatRequest struct {
 	Messages []Message
 	Tools    []ToolSpec
+	// JSONMode 为 true 时要求 provider 强制输出合法 JSON（response_format=json_object）。
+	// 用于工具调用模拟路径，从源头杜绝模型输出不规范 JSON。
+	JSONMode bool
 }
 
 // Usage 是一次调用的 token 用量。

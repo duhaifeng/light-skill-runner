@@ -83,7 +83,7 @@ script_timeout: 60s
 
 本地数据库默认写入 `./data/light-skill-runner.db`。建表脚本维护在 `scripts/db`，程序启动时会自动执行迁移；模型配置和 skill 启用状态可以在界面「设置」页维护。
 
-每次运行会写入两类排查文件：完整结构化 trace 在 `./traces/<trace_id>.json`，可读过程日志在 `./logs/<trace_id>.log`，并追加汇总到 `./logs/runs.log`。
+每次运行会写入两类排查文件：完整结构化 trace 在 `./traces/<trace_id>.json`，可读过程日志按应用启动时间写入 `./logs/<yyyyMMdd-HHmmss>.log`，并追加汇总到 `./logs/runs.log`。
 
 ### 接苏格拉底网关示例
 

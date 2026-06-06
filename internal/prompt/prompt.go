@@ -40,9 +40,9 @@ func New(diskDir string) *Manager {
 	return &Manager{diskDir: diskDir}
 }
 
-// System 渲染主系统提示。
-func (m *Manager) System(skills []SkillInfo) (string, error) {
-	return m.render(TmplSystem, map[string]any{"Skills": skills})
+// System 渲染主系统提示。osInfo 描述当前运行环境，帮助模型选择命令语法。
+func (m *Manager) System(skills []SkillInfo, osInfo string) (string, error) {
+	return m.render(TmplSystem, map[string]any{"Skills": skills, "OS": osInfo})
 }
 
 // ToolEmulation 渲染本地模型工具调用模拟提示。

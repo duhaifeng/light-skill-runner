@@ -4,6 +4,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -14,6 +15,7 @@ type Config struct {
 	LLM    LLMConfig    `yaml:"llm"`
 	Trace  TraceConfig  `yaml:"trace"`
 	Server ServerConfig `yaml:"server"`
+	Tools  ToolsConfig  `yaml:"tools"`
 
 	PromptsDir    string        `yaml:"prompts_dir"`
 	SkillsDir     string        `yaml:"skills_dir"`
@@ -46,6 +48,24 @@ type ServerConfig struct {
 	Port int `yaml:"port"`
 }
 
+// ToolsConfig 描述内置工具的能力与安全配置。
+type ToolsConfig struct {
+	// AllowArbitraryPaths 为 true 时关闭"限制在工作目录内"的沙箱，
+	// 允许 read_file/write_file/run_script/run_command 访问任意路径。
+	AllowArbitraryPaths bool          `yaml:"allow_arbitrary_paths"`
+	Command             CommandConfig `yaml:"command"`
+}
+
+// CommandConfig 描述 run_command 工具的配置。
+type CommandConfig struct {
+	Enabled bool `yaml:"enabled"` // 是否注册 run_command 工具
+	// Whitelist 是允许执行的程序名（按 basename 不区分大小写匹配）。
+	Whitelist []string      `yaml:"whitelist"`
+	Timeout   time.Duration `yaml:"timeout"` // 单条命令超时
+	// EmptyWhitelistDenies 为 true 时，空白名单表示"拒绝全部"（更安全）。
+	EmptyWhitelistDenies bool `yaml:"empty_whitelist_denies"`
+}
+
 // Default 返回带合理默认值的配置。
 func Default() Config {
 	return Config{
@@ -58,7 +78,16 @@ func Default() Config {
 			Dir:       "./traces",
 			LogDir:    "./logs",
 		},
-		Server:        ServerConfig{Port: 8080},
+		Server: ServerConfig{Port: 8080},
+		Tools: ToolsConfig{
+			AllowArbitraryPaths: false, // 安全默认：保持工作目录沙箱
+			Command: CommandConfig{
+				Enabled:              true,
+				Whitelist:            []string{"cmd", "powershell", "pwsh", "where", "go", "python", "node", "git", "ls", "dir", "cat", "type"},
+				Timeout:              30 * time.Second,
+				EmptyWhitelistDenies: true,
+			},
+		},
 		PromptsDir:    "./prompts",
 		SkillsDir:     "./skills",
 		WorkDir:       ".",
@@ -117,5 +146,24 @@ func applyEnv(cfg *Config) {
 		if p, err := strconv.Atoi(v); err == nil {
 			cfg.Server.Port = p
 		}
+	}
+	if v := os.Getenv("TOOLS_ALLOW_ARBITRARY_PATHS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Tools.AllowArbitraryPaths = b
+		}
+	}
+	if v := os.Getenv("TOOLS_COMMAND_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.Tools.Command.Enabled = b
+		}
+	}
+	if v := os.Getenv("TOOLS_COMMAND_WHITELIST"); v != "" {
+		var list []string
+		for _, item := range strings.Split(v, ",") {
+			if s := strings.TrimSpace(item); s != "" {
+				list = append(list, s)
+			}
+		}
+		cfg.Tools.Command.Whitelist = list
 	}
 }

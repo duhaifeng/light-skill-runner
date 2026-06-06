@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"sync"
+	"time"
 
 	"github.com/duhaifeng/light-skill-runner/internal/config"
 	"github.com/duhaifeng/light-skill-runner/internal/executor"
@@ -27,6 +29,7 @@ type Engine struct {
 	prompts *prompt.Manager
 	client  llm.Client
 	store   *store.Store
+	logID   string
 }
 
 // RunResult 是一次运行的结果。
@@ -76,6 +79,7 @@ func New(cfg config.Config) (*Engine, error) {
 		prompts: prompt.New(cfg.PromptsDir),
 		client:  client,
 		store:   st,
+		logID:   time.Now().Format("20060102-150405"),
 	}, nil
 }
 
@@ -166,17 +170,24 @@ func (e *Engine) Run(ctx context.Context, userPrompt string, extraExporters ...t
 			exporters = append(exporters, trace.NewFileExporter(e.cfg.Trace.Dir))
 		}
 		if name == "log" {
-			exporters = append(exporters, trace.NewLogExporter(e.cfg.Trace.LogDir))
+			exporters = append(exporters, trace.NewLogExporter(e.cfg.Trace.LogDir, e.logID))
 		}
 	}
 	exporters = append(exporters, extraExporters...)
 
 	tracer := trace.NewTracer("skill-run", userPrompt, exporters...)
 
-	// 每次运行构建工具集（绑定 workdir / 超时）。
-	exec := executor.New(e.cfg.WorkDir, e.cfg.ScriptTimeout)
+	// 每次运行构建工具集（绑定 workdir / 超时 / 安全开关）。
+	exec := executor.New(e.cfg.WorkDir, e.cfg.ScriptTimeout, e.cfg.Tools.AllowArbitraryPaths, e.cfg.Tools.Command.Timeout)
 	toolReg := tools.New()
-	tools.RegisterBuiltins(toolReg, e.reg, exec, e.cfg.WorkDir)
+	tools.RegisterBuiltins(toolReg, e.reg, exec, e.cfg.WorkDir, tools.Options{
+		AllowArbitraryPaths: e.cfg.Tools.AllowArbitraryPaths,
+		Command: tools.CommandOptions{
+			Enabled:              e.cfg.Tools.Command.Enabled,
+			Whitelist:            e.cfg.Tools.Command.Whitelist,
+			EmptyWhitelistDenies: e.cfg.Tools.Command.EmptyWhitelistDenies,
+		},
+	})
 
 	systemPrompt, emulate, err := e.buildSystemPrompt(toolReg)
 	if err != nil {
@@ -242,6 +253,18 @@ func loadEnabledSkills(skillsDir string, st *store.Store) ([]loader.Skill, error
 	return out, nil
 }
 
+// osInfo 返回当前运行环境描述，帮助模型选择正确的命令语法。
+func osInfo() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Windows (命令行用 cmd 或 powershell；列目录如 run_command cmd [\"/c\",\"dir\",\"C:\\\\\"])"
+	case "darwin":
+		return "macOS (命令行用 sh/bash；列目录如 run_command ls [\"-la\",\"/\"])"
+	default:
+		return runtime.GOOS + " (类 Unix，命令行用 sh/bash)"
+	}
+}
+
 func applyModel(cfg *config.Config, m store.ModelConfig) {
 	cfg.LLM.Provider = m.Provider
 	cfg.LLM.BaseURL = m.BaseURL
@@ -256,7 +279,7 @@ func (e *Engine) buildSystemPrompt(toolReg *tools.Registry) (string, bool, error
 	for _, s := range e.reg.List() {
 		skills = append(skills, prompt.SkillInfo{Name: s.Name, Description: s.Description})
 	}
-	system, err := e.prompts.System(skills)
+	system, err := e.prompts.System(skills, osInfo())
 	if err != nil {
 		return "", false, err
 	}

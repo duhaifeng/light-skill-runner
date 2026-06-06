@@ -18,22 +18,27 @@ type OpenAIClient struct {
 	APIKey             string
 	Model              string
 	ChatTemplateKwargs map[string]any
+	Temperature        *float64 // 默认采样温度；nil 表示不下发
+	MaxTokens          int      // 最大生成 token；0 表示不下发
 	HTTP               *http.Client
 	caps               Capabilities
 }
 
 // NewOpenAI 创建一个 OpenAI 兼容客户端。
+// 默认 temperature=0：Agent 场景追求确定性，能显著降低工具调用 JSON 漂移。
 func NewOpenAI(baseURL, apiKey, model string) *OpenAIClient {
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
+	zero := 0.0
 	return &OpenAIClient{
-		BaseURL: baseURL,
-		APIKey:  apiKey,
-		Model:   model,
-		HTTP:    &http.Client{Timeout: 120 * time.Second},
-		caps:    Capabilities{SupportsTools: true, SupportsStreaming: false},
+		BaseURL:     baseURL,
+		APIKey:      apiKey,
+		Model:       model,
+		Temperature: &zero,
+		HTTP:        &http.Client{Timeout: 120 * time.Second},
+		caps:        Capabilities{SupportsTools: true, SupportsStreaming: false},
 	}
 }
 
@@ -90,11 +95,18 @@ type wireTool struct {
 	} `json:"function"`
 }
 
+type wireResponseFormat struct {
+	Type string `json:"type"`
+}
+
 type wireRequest struct {
-	Model              string         `json:"model"`
-	Messages           []wireMessage  `json:"messages"`
-	Tools              []wireTool     `json:"tools,omitempty"`
-	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
+	Model              string              `json:"model"`
+	Messages           []wireMessage       `json:"messages"`
+	Tools              []wireTool          `json:"tools,omitempty"`
+	Temperature        *float64            `json:"temperature,omitempty"`
+	MaxTokens          int                 `json:"max_tokens,omitempty"`
+	ResponseFormat     *wireResponseFormat `json:"response_format,omitempty"`
+	ChatTemplateKwargs map[string]any      `json:"chat_template_kwargs,omitempty"`
 }
 
 func newSocratesGW(cfg ProviderConfig) (Client, error) {
@@ -107,7 +119,8 @@ func newSocratesGW(cfg ProviderConfig) (Client, error) {
 		model = "Qwen3.5-397B-A17B-FP8"
 	}
 	c := NewOpenAI(base, cfg.APIKey, model)
-	c.caps.SupportsTools = false
+	// 网关走 OpenAI 兼容协议，支持原生 tools；由 force_tool_emulation 开关控制是否启用。
+	c.caps.SupportsTools = !cfg.ForceToolEmulation
 	c.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
 	return c, nil
 }
@@ -131,7 +144,12 @@ type wireResponse struct {
 func (c *OpenAIClient) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
 	wreq := wireRequest{
 		Model:              c.Model,
+		Temperature:        c.Temperature,
+		MaxTokens:          c.MaxTokens,
 		ChatTemplateKwargs: c.ChatTemplateKwargs,
+	}
+	if req.JSONMode {
+		wreq.ResponseFormat = &wireResponseFormat{Type: "json_object"}
 	}
 	for _, m := range req.Messages {
 		wm := wireMessage{

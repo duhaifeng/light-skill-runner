@@ -132,24 +132,37 @@ func (r *Runner) runNative(ctx context.Context, messages []llm.Message) (string,
 	return "", fmt.Errorf("达到最大轮数 %d 仍未完成", r.MaxTurns)
 }
 
+// maxParseRetries 是模拟模式下连续解析失败的最大重试次数（超过则显式报错，不假成功）。
+const maxParseRetries = 3
+
+// emuToolCall 是模拟协议里的一次工具调用。
+type emuToolCall struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
 // emuReply 是模拟模式下期望模型输出的 JSON 结构：
 // 模型每轮只能二选一——发起一次工具调用(tool_call=Action)，或给出最终答案(final=结束)。
 type emuReply struct {
-	ToolCall *struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
-	} `json:"tool_call"`
-	Final *string `json:"final"`
+	ToolCall *emuToolCall `json:"tool_call"`
+	Final    *string      `json:"final"`
 }
 
 // runEmulated 走提示词模拟路径：不下发 tools，靠约定的 JSON 文本表达 Action / 结束。
 // 用于不支持原生 function-calling 的本地/弱模型，更接近 ReAct 原论文的纯文本协议。
+//
+// 健壮性设计（针对"模型输出不规范 JSON 导致工具不执行"）：
+//   - 请求开启 JSONMode，让网关强制返回合法 JSON；
+//   - 解析宽松（剥离代码块、自动补齐缺失的右括号、容忍尾随逗号）；
+//   - 解析失败不再静默当成"最终答案"，而是回灌纠错提示重试，超过上限则显式报错。
 func (r *Runner) runEmulated(ctx context.Context, messages []llm.Message) (string, error) {
+	parseFailures := 0
+
 	// ===== ReAct 主循环（模拟版）=====
 	for turn := 1; turn <= r.MaxTurns; turn++ {
 		// --- Thought + 决策 ---
-		// 不发送 Tools；模型按 tool_emulation 协议输出一段 JSON 表达其决策。
-		resp, err := r.chat(ctx, turn, llm.ChatRequest{Messages: messages})
+		// 不发送 Tools；开启 JSONMode 让网关强制输出合法 JSON。
+		resp, err := r.chat(ctx, turn, llm.ChatRequest{Messages: messages, JSONMode: true})
 		if err != nil {
 			// [终止·出错]
 			return "", fmt.Errorf("第 %d 轮调用失败: %w", turn, err)
@@ -157,12 +170,27 @@ func (r *Runner) runEmulated(ctx context.Context, messages []llm.Message) (strin
 		content := resp.Message.Content
 		messages = append(messages, llm.Message{Role: llm.RoleAssistant, Content: content})
 
-		// 从模型输出中宽松解析意图（容忍代码块包裹与多余文字）。
 		reply, ok := parseEmuReply(content)
 		if !ok {
-			// [终止·容错] 模型未遵守协议（解析不出 tool_call/final），把原文当最终答案。
-			return content, nil
+			// 区分两种"解析失败"：
+			if !looksLikeProtocol(content) {
+				// [终止·正常] 是纯自然语言答复（没有协议痕迹）→ 当作最终答案。
+				return content, nil
+			}
+			// 模型想调用工具但 JSON 坏了：重试，而不是静默结束。
+			parseFailures++
+			if parseFailures > maxParseRetries {
+				// [终止·错误] 连续解析失败，显式报错（trace 标 error），不再假成功。
+				return "", fmt.Errorf("模型连续 %d 次输出无法解析的协议 JSON，最后一次：%s", parseFailures, truncate(content, 300))
+			}
+			messages = append(messages, llm.Message{
+				Role:    llm.RoleUser,
+				Content: "你上一条不是合法的协议 JSON。请严格只输出一个合法 JSON：{\"tool_call\": {\"name\": \"...\", \"arguments\": { ... }}} 或 {\"final\": \"...\"}，不要任何额外文字、解释或代码块标记。",
+			})
+			continue
 		}
+		parseFailures = 0
+
 		if reply.Final != nil {
 			// [终止·正常] 模型主动用 final 收尾。
 			return *reply.Final, nil
@@ -179,7 +207,7 @@ func (r *Runner) runEmulated(ctx context.Context, messages []llm.Message) (strin
 		result := r.callTool(ctx, "", reply.ToolCall.Name, args) // Action
 		messages = append(messages, llm.Message{ // Observation
 			Role:    llm.RoleUser,
-			Content: fmt.Sprintf("工具 %s 的执行结果：\n%s\n\n请据此继续（输出 tool_call 或 final 的 JSON）。", reply.ToolCall.Name, result),
+			Content: fmt.Sprintf("工具 %s 的执行结果：\n%s\n\n请据此继续（只输出 tool_call 或 final 的 JSON）。", reply.ToolCall.Name, result),
 		})
 	}
 	// [终止·熔断]
@@ -187,29 +215,46 @@ func (r *Runner) runEmulated(ctx context.Context, messages []llm.Message) (strin
 }
 
 // parseEmuReply 从模型输出中宽松提取 JSON 并解析为 emuReply。
+// 既接受标准结构 {"tool_call":{...}} / {"final":...}，
+// 也容错模型把工具调用拍平成 {"name":..., "arguments":...} 的情况。
 func parseEmuReply(content string) (emuReply, bool) {
 	raw := extractJSON(content)
 	if raw == "" {
 		return emuReply{}, false
 	}
 	var reply emuReply
-	if err := json.Unmarshal([]byte(raw), &reply); err != nil {
-		return emuReply{}, false
+	if err := json.Unmarshal([]byte(raw), &reply); err == nil {
+		if reply.ToolCall != nil || reply.Final != nil {
+			return reply, true
+		}
 	}
-	if reply.ToolCall == nil && reply.Final == nil {
-		return emuReply{}, false
+	// 回退：模型可能把工具调用拍平成 {"name":..., "arguments":...}
+	var flat emuToolCall
+	if err := json.Unmarshal([]byte(raw), &flat); err == nil && flat.Name != "" {
+		return emuReply{ToolCall: &flat}, true
 	}
-	return reply, true
+	return emuReply{}, false
 }
 
-// extractJSON 提取首个平衡的 JSON 对象（容忍代码块包裹与额外文字）。
+// looksLikeProtocol 判断输出是否"试图"遵守协议（含 JSON / 关键字），
+// 用于区分"模型想调用工具但格式坏"与"模型给的纯自然语言答复"。
+func looksLikeProtocol(s string) bool {
+	t := strings.TrimSpace(s)
+	return strings.HasPrefix(t, "{") || strings.HasPrefix(t, "```") ||
+		strings.Contains(t, "tool_call") || strings.Contains(t, "\"final\"")
+}
+
+// extractJSON 提取首个 JSON 对象，并尽力修复常见缺陷：
+//   - 跳过 JSON 前的多余文字，定位首个 '{'；
+//   - 用括号栈匹配 {} 与 []；
+//   - 若结尾未闭合（截断/漏括号），自动补齐缺失的右括号并去除尾随逗号。
 func extractJSON(s string) string {
 	s = strings.TrimSpace(s)
-	start := strings.Index(s, "{")
+	start := strings.IndexByte(s, '{')
 	if start < 0 {
 		return ""
 	}
-	depth := 0
+	var stack []byte // 期望的闭合符栈
 	inStr := false
 	esc := false
 	for i := start; i < len(s); i++ {
@@ -229,15 +274,66 @@ func extractJSON(s string) string {
 		case '"':
 			inStr = true
 		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return s[start : i+1]
+			stack = append(stack, '}')
+		case '[':
+			stack = append(stack, ']')
+		case '}', ']':
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+			if len(stack) == 0 {
+				return sanitizeJSON(s[start : i+1])
 			}
 		}
 	}
+	// 未闭合：自动补齐缺失的右括号（容忍截断/漏括号，如 "...]}}" 漏掉最外层 '}'）。
+	if len(stack) > 0 {
+		fixed := strings.TrimRight(s[start:], " \t\r\n,")
+		for i := len(stack) - 1; i >= 0; i-- {
+			fixed += string(stack[i])
+		}
+		return sanitizeJSON(fixed)
+	}
 	return ""
+}
+
+// sanitizeJSON 去除对象/数组里的尾随逗号（如 {"a":1,} 或 [1,2,]），
+// 这类写法 Go 的 json 不接受，但弱模型偶尔会产出。字符串内的逗号不受影响。
+func sanitizeJSON(s string) string {
+	b := make([]byte, 0, len(s))
+	inStr := false
+	esc := false
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inStr {
+			b = append(b, ch)
+			switch {
+			case esc:
+				esc = false
+			case ch == '\\':
+				esc = true
+			case ch == '"':
+				inStr = false
+			}
+			continue
+		}
+		if ch == '"' {
+			inStr = true
+			b = append(b, ch)
+			continue
+		}
+		if ch == ',' {
+			j := i + 1
+			for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n') {
+				j++
+			}
+			if j < len(s) && (s[j] == '}' || s[j] == ']') {
+				continue // 丢弃尾随逗号
+			}
+		}
+		b = append(b, ch)
+	}
+	return string(b)
 }
 
 func lastContent(messages []llm.Message) string {
@@ -255,4 +351,13 @@ func summarizeToolCalls(calls []llm.ToolCall) string {
 		parts = append(parts, fmt.Sprintf("%s(%s)", c.Name, c.Arguments))
 	}
 	return "工具调用: " + strings.Join(parts, ", ")
+}
+
+// truncate 按 rune 安全截断，用于日志/错误信息。
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "..."
 }

@@ -6,6 +6,9 @@
 /skill-desktop
 *.exe
 
+# IDE
+.idea/
+
 # 运行期产物
 /traces/
 /logs/

@@ -16,6 +16,17 @@ trace:
 server:
   port: 8080
 
+tools:
+  # 关闭工作目录沙箱：允许 read_file/write_file/run_script/run_command 访问任意路径。
+  # 注意：这会让引擎获得与运行账户同等的文件/命令权限，风险自担。
+  allow_arbitrary_paths: true
+  command:
+    enabled: true                # 注册 run_command 工具
+    # 仅以下程序名（按 basename，不区分大小写）允许执行。空白名单=拒绝全部。
+    whitelist: [cmd, powershell, pwsh, where, go, python, node, git, ls, dir, cat, type]
+    timeout: 30s
+    empty_whitelist_denies: true
+
 prompts_dir: ./prompts        # 留空则使用内嵌默认提示词
 skills_dir: ./skills
 workdir: .
